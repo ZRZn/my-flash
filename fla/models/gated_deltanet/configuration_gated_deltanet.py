@@ -41,6 +41,7 @@ class GatedDeltaNetConfig(PretrainedConfig):
         fuse_linear_cross_entropy: bool = False,
         use_l2warp: bool = False,
         vocab_size: int = 32000,
+        top_k: int = 0,
         **kwargs
     ):
         self.attn_mode = attn_mode
@@ -70,7 +71,8 @@ class GatedDeltaNetConfig(PretrainedConfig):
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
         self.allow_neg_eigval = allow_neg_eigval
-
+        self.top_k = top_k
+        
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
                 "`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time."

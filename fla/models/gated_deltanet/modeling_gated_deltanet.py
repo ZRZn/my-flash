@@ -69,7 +69,8 @@ class GatedDeltaNetBlock(GradientCheckpointingLayer):
                 allow_neg_eigval=config.allow_neg_eigval,
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
+                top_k = config.top_k
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedDeltaNetMLP(

@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.gated_delta_lora import chunk_gated_delta_lora
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -101,6 +102,7 @@ class GatedDeltaNet(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        top_k: int = 0,
         **kwargs
     ) -> GatedDeltaNet:
         super().__init__()
@@ -125,6 +127,12 @@ class GatedDeltaNet(nn.Module):
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
         self.layer_idx = layer_idx
 
+        self.top_k = top_k
+        #use lora
+        if top_k > 0:
+            self.head_k_ori = self.head_k_dim - int(self.head_k_dim * 0.125)
+            self.head_v_ori = self.head_v_dim - int(self.head_v_dim * 0.125)
+            
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
             raise ValueError(
@@ -272,17 +280,33 @@ class GatedDeltaNet(nn.Module):
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
-            o, recurrent_state = chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True
-            )
+            if self.top_k <= 0:
+                o, recurrent_state = chunk_gated_delta_rule(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=True
+                )
+            else:
+                o, recurrent_state = chunk_gated_delta_lora(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=True,
+                    head_k_ori=self.head_k_ori,
+                    head_v_ori=self.head_v_ori,
+                    top_k=self.top_k
+                )
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_gated_delta_rule(
                 q=q,
