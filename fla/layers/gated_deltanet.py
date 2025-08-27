@@ -281,7 +281,7 @@ class GatedDeltaNet(nn.Module):
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
-            print("top_k:",self.top_k)
+            # print("top_k:",self.top_k)
             if self.top_k <= 0:
                 o, recurrent_state = chunk_gated_delta_rule(
                     q=q,
