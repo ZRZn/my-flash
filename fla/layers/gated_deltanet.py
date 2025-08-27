@@ -128,6 +128,7 @@ class GatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
 
         self.top_k = top_k
+        self.top_k = 16
         #use lora
         if top_k > 0:
             self.head_k_ori = self.head_k_dim - int(self.head_k_dim * 0.125)
