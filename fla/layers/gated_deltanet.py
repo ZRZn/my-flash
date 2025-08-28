@@ -129,11 +129,12 @@ class GatedDeltaNet(nn.Module):
 
         self.top_k = top_k
         self.top_k = 16
+        rate = 0.25
         #use lora
         if top_k > 0:
-            self.head_k_ori = self.head_k_dim - int(self.head_k_dim * 0.125)
-            self.head_v_ori = self.head_v_dim - int(self.head_v_dim * 0.125)
-            
+            self.head_k_ori = self.head_k_dim - int(self.head_k_dim * rate)
+            self.head_v_ori = self.head_v_dim - int(self.head_v_dim * rate)
+        
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
             raise ValueError(
