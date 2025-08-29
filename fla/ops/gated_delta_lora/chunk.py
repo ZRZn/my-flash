@@ -370,7 +370,7 @@ def chunk_gated_delta_lora(
     chunk_indices_for_t = t_indices // chunk_size
     # causal_mask 的形状是 [T, N], 当 n < (t // C) 时，值为 True，表示允许访问
     causal_mask = n_indices < chunk_indices_for_t
-    masked_scores = scores.masked_fill_(causal_mask, -torch.inf)
+    masked_scores = scores.masked_fill_(~causal_mask, -torch.inf)
     top_scores, top_indices = torch.topk(masked_scores, k=top_k, dim=-1)
     indices_for_gather = top_indices.view(B, H, T, top_k, 1, 1).expand(-1, -1, -1, -1, K, V)
     h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
