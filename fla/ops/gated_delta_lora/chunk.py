@@ -134,7 +134,6 @@ def chunk_gated_delta_lora_bwd(
         dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        dh=dh_lora,
     )
     dq, dk, dw, dg = chunk_bwd_dqkwg(
         q=q,

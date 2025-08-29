@@ -487,7 +487,6 @@ def chunk_gated_delta_rule_bwd_dhu(
     scale: float,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
-    dh: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -499,8 +498,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
-    if dh is None:
-        dh = q.new_empty(B, NT, H, K, V)
+    dh = q.new_empty(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
