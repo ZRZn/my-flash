@@ -30,7 +30,7 @@ def chunk_gated_delta_lora_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
+    # obtain WY representation. u   is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
@@ -51,6 +51,12 @@ def chunk_gated_delta_lora_fwd(
         g=g,
         cu_seqlens=cu_seqlens,
     )
+    chunk_size = 64
+    B, H, T, K = k.shape
+    _, _, _, V = u.shape
+    N = T // 64
+    h_independent = torch.matmul(k.view(B, H, N, chunk_size, K).transpose(-2, -1), u.view(B, H, N, chunk_size, V))
+
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -69,7 +75,7 @@ def chunk_gated_delta_lora_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    return g, o, A, h, final_state
+    return g, o, A, h_independent, final_state
 
 
 def chunk_gated_delta_lora_bwd(
@@ -103,6 +109,12 @@ def chunk_gated_delta_lora_bwd(
         output_final_state=False,
         cu_seqlens=cu_seqlens,
     )
+    if dh_lora is not None:
+        # du_from_h_prime = k @ dh_independent.transpose(-2, -1)
+        du_from_h_prime = torch.matmul(k, dh_lora.transpose(-2, -1))
+        # dk_from_h_prime = u @ dh_independent
+        dk_from_h_prime = torch.matmul(u, dh_lora)
+
     dv = chunk_bwd_dv_local(
         q=q,
         k=k,
@@ -137,6 +149,14 @@ def chunk_gated_delta_lora_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+    if dh_lora is not None:
+        # Accumulate gradient for u (represented by dv).
+        # This MUST be done before calling prepare_wy_repr_bwd, which consumes dv (as du).
+        dv.add_(du_from_h_prime)
+        
+        # Accumulate gradient for k.
+        # This can be done here or later, but doing it now keeps things tidy.
+        dk.add_(dk_from_h_prime)
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
         v=v,
@@ -355,7 +375,7 @@ def chunk_gated_delta_lora(
     )
 
     # 计算lora逻辑
-    h = h.transpose(1, 2)
+    # h = h.transpose(1, 2)
     h = h[:, :, :, head_k_ori:, head_v_ori:]
     chunk_size = 64
     B, T, H, _ = q.shape
