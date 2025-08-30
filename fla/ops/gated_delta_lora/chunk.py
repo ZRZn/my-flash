@@ -51,11 +51,11 @@ def chunk_gated_delta_lora_fwd(
         g=g,
         cu_seqlens=cu_seqlens,
     )
-    chunk_size = 64
-    B, H, T, K = k.shape
-    _, _, _, V = u.shape
-    N = T // 64
-    h_independent = torch.matmul(k.view(B, H, N, chunk_size, K).transpose(-2, -1), u.view(B, H, N, chunk_size, V))
+    # chunk_size = 64
+    # B, H, T, K = k.shape
+    # _, _, _, V = u.shape
+    # N = T // 64
+    # h_independent = torch.matmul(k.view(B, H, N, chunk_size, K).transpose(-2, -1), u.view(B, H, N, chunk_size, V))
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -75,7 +75,7 @@ def chunk_gated_delta_lora_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    return g, o, A, h_independent, final_state
+    return g, o, A, h, final_state
 
 
 def chunk_gated_delta_lora_bwd(
@@ -109,11 +109,11 @@ def chunk_gated_delta_lora_bwd(
         output_final_state=False,
         cu_seqlens=cu_seqlens,
     )
-    if dh_lora is not None:
-        # du_from_h_prime = k @ dh_independent.transpose(-2, -1)
-        du_from_h_prime = torch.matmul(k, dh_lora.transpose(-2, -1))
-        # dk_from_h_prime = u @ dh_independent
-        dk_from_h_prime = torch.matmul(u, dh_lora)
+    # if dh_lora is not None:
+    #     # du_from_h_prime = k @ dh_independent.transpose(-2, -1)
+    #     du_from_h_prime = torch.matmul(k, dh_lora.transpose(-2, -1))
+    #     # dk_from_h_prime = u @ dh_independent
+    #     dk_from_h_prime = torch.matmul(u, dh_lora)
 
     dv = chunk_bwd_dv_local(
         q=q,
@@ -134,6 +134,7 @@ def chunk_gated_delta_lora_bwd(
         dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        dh=dh_lora,
     )
     dq, dk, dw, dg = chunk_bwd_dqkwg(
         q=q,
@@ -148,14 +149,14 @@ def chunk_gated_delta_lora_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    if dh_lora is not None:
-        # Accumulate gradient for u (represented by dv).
-        # This MUST be done before calling prepare_wy_repr_bwd, which consumes dv (as du).
-        dv.add_(du_from_h_prime)
+    # if dh_lora is not None:
+    #     # Accumulate gradient for u (represented by dv).
+    #     # This MUST be done before calling prepare_wy_repr_bwd, which consumes dv (as du).
+    #     dv.add_(du_from_h_prime)
         
-        # Accumulate gradient for k.
-        # This can be done here or later, but doing it now keeps things tidy.
-        dk.add_(dk_from_h_prime)
+    #     # Accumulate gradient for k.
+    #     # This can be done here or later, but doing it now keeps things tidy.
+    #     dk.add_(dk_from_h_prime)
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
         v=v,
@@ -374,7 +375,7 @@ def chunk_gated_delta_lora(
     )
 
     # 计算lora逻辑
-    # h = h.transpose(1, 2)
+    h = h.transpose(1, 2)
     h = h[:, :, :, head_k_ori:, head_v_ori:]
     chunk_size = 64
     B, T, H, _ = q.shape
@@ -398,6 +399,7 @@ def chunk_gated_delta_lora(
     # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
     # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
     weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # weights [B, H, T, topk, 1]
+    weights = torch.nan_to_num(weights, nan=0.0)
     o_lora = torch.sum(o_lora_all * weights, dim=-2)  # [B, T, H, v_lora]
     o_final = torch.concat([o[:, :, :, :head_v_ori], o_lora.transpose(1, 2)], dim=-1)
     return o_final, final_state
