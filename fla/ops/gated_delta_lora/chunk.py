@@ -140,6 +140,8 @@ def chunk_gated_delta_lora_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens, 
     )
+    print("do = ", torch.mean(do[..., int(V * 0.875):]))
+    print("dh = ", torch.mean(do[..., int(K * 0.875):,int(V * 0.875):]))
     dq, dk, dw, dg = chunk_bwd_dqkwg(
         q=q,
         k=k,
@@ -157,11 +159,13 @@ def chunk_gated_delta_lora_bwd(
         # Accumulate gradient for u (represented by dv).
         # This MUST be done before calling prepare_wy_repr_bwd, which consumes dv (as du).
         # dv.add_(du_from_h_prime)
+        print("dv = ", torch.mean(dv[..., int(V * 0.875):]))
         dv[..., int(V * 0.875):] += du_lora
         
         # Accumulate gradient for k.
         # This can be done here or later, but doing it now keeps things tidy.
         # dk.add_(dk_from_h_prime)
+        print("dk = ", torch.mean(dk[..., int(K * 0.875):]))
         dk[..., int(K * 0.875):] += dk_lora
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
