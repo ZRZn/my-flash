@@ -274,7 +274,7 @@ def chunk_topk_lora_pytorch(
     top_k: int,
     chunk_size: int,
     head_k_ori: int = 0,
-    block_t: int = 256,     # T方向tile
+    block_t: int = 128,     # T方向tile
 ):
     """
     返回：o_lora [B, T, H, V]

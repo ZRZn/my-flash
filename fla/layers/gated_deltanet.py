@@ -128,7 +128,7 @@ class GatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
 
         self.top_k = top_k
-        self.top_k = 2
+        self.top_k = 8
         rate = 0.125
         #use lora
         if top_k > 0:
