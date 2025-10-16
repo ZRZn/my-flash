@@ -265,7 +265,7 @@ class ChunkGatedDeltaLoraFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
         return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
 
-# @torch.compile
+@torch.compile
 def chunk_topk_lora_pytorch(
     q,                 # [B, T, H, K_total]
     k_cmp,             # [B, H, N, K_lora]  —— 已做mean_pooling后的K
