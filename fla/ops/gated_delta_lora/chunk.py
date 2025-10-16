@@ -56,6 +56,7 @@ def chunk_gated_delta_lora_fwd(
     V = u.shape[-1]
     N = T // 64
     h_independent = torch.einsum("bnchk, bnchv -> bnhkv", k[:, :, :, int(K * 0.875):].view(B, N, chunk_size, H, int(K * 0.125)), u[:, :, :, int(V * 0.875):].view(B, N, chunk_size, H, int(V * 0.125)))
+    # print("h_independent = ", h_independent.shape)
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -115,6 +116,7 @@ def chunk_gated_delta_lora_bwd(
     chunk_size = 64
     if dh_lora is not None:
         # du_from_h_prime = k @ dh_independent.transpose(-2, -1)
+        # print("dh_lora = ", dh_lora.shape)
         k_lora = k[:, :, :, int(K * 0.875):].view(B, N, chunk_size, H, int(K * 0.125))
         u_lora = u[:, :, :, int(V * 0.875):].view(B, N, chunk_size, H, int(V * 0.125))
         dk_lora = torch.einsum("bnhkv, bnchv -> bnchk", dh_lora, u_lora).reshape(B, T, H, int(K * 0.125))
@@ -138,10 +140,11 @@ def chunk_gated_delta_lora_bwd(
         do=do,
         dv=dv,
         scale=scale,
-        cu_seqlens=cu_seqlens, 
+        cu_seqlens=cu_seqlens,
     )
-    print("do = ", torch.mean(do[..., int(V * 0.875):]))
-    print("dh = ", torch.mean(do[..., int(K * 0.875):,int(V * 0.875):]))
+    # print("do = ", torch.mean(do[..., int(V * 0.875):]))
+    # print("dh1 = ", torch.mean(dh[..., int(K * 0.875):, :]))
+    # print("dh2 = ", torch.mean(dh[..., int(V * 0.875):]))
     dq, dk, dw, dg = chunk_bwd_dqkwg(
         q=q,
         k=k,
@@ -159,14 +162,15 @@ def chunk_gated_delta_lora_bwd(
         # Accumulate gradient for u (represented by dv).
         # This MUST be done before calling prepare_wy_repr_bwd, which consumes dv (as du).
         # dv.add_(du_from_h_prime)
-        print("dv = ", torch.mean(dv[..., int(V * 0.875):]))
+        # print("dv = ", torch.mean(dv[..., int(V * 0.875):]))
         dv[..., int(V * 0.875):] += du_lora
-        
         # Accumulate gradient for k.
         # This can be done here or later, but doing it now keeps things tidy.
         # dk.add_(dk_from_h_prime)
-        print("dk = ", torch.mean(dk[..., int(K * 0.875):]))
+        # print("dk = ", torch.mean(dk[..., int(K * 0.875):]))
+        # print("dq = ", torch.mean(dq[..., int(K * 0.875):]))
         dk[..., int(K * 0.875):] += dk_lora
+
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
         v=v,
@@ -261,6 +265,88 @@ class ChunkGatedDeltaLoraFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
         return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
 
+@torch.compile
+def chunk_topk_lora_pytorch(
+    q,                 # [B, T, H, K_total]
+    k_cmp,             # [B, H, N, K_lora]  —— 已做mean_pooling后的K
+    h,                 # [B, H, N, K_lora, V]
+    *,
+    top_k: int,
+    chunk_size: int,
+    head_k_ori: int = 0,
+    block_t: int = 256,     # T方向tile
+):
+    """
+    返回：o_lora [B, T, H, V]
+    与你原逻辑等价：q_lora对k_cmp做top-k，取对应chunk的h，并计算q@h后按softmax(topk scores)加权求和。
+    """
+    device = q.device
+    dtype_q = q.dtype
+
+    # 预处理到 [BH, ...] 的扁平视图，减少花式广播和维度转置成本
+    B, T, H, K_total = q.shape
+    BH = B * H
+    # 只取 LoRA 部分
+    q_lora = q[:, :, :, head_k_ori:].transpose(1, 2).contiguous()        # [B, H, T, K]
+    k_cmp  = k_cmp.contiguous()                                           # [B, H, N, K]
+    h      = h.contiguous()                                               # [B, H, N, K, V]
+
+    _, _, N, K = k_cmp.shape
+    V = h.shape[-1]
+
+    q_bh = q_lora.reshape(BH, T, K)               # [BH, T, K]
+    k_bh = k_cmp.reshape(BH, N, K)                # [BH, N, K]
+    h_bh = h.reshape(BH, N, K, V)                 # [BH, N, K, V]
+
+    o_bh = torch.zeros((BH, T, V), device=device, dtype=dtype_q)
+
+    for t0 in range(0, T, block_t):
+        t1 = min(T, t0 + block_t)
+        tb = t1 - t0
+        q_blk = q_bh[:, t0:t1, :]                                  # [BH, tb, K]
+
+        # 计算 Top-K（两种方式：一次性 or N方向流式）
+        # 一次性算 [BH, tb, N] 分数（适合N中等）
+        # scores = q_blk @ k_bh^T
+        scores = torch.bmm(q_blk, k_bh.transpose(1, 2))        # [BH, tb, N]
+
+        # 微型因果mask：[tb, N]
+        t_idx = torch.arange(t0, t1, device=device).view(1, tb, 1)   # 真实时间步
+        n_idx = torch.arange(N, device=device).view(1, 1, N)
+        causal_mask = (n_idx < (t_idx // chunk_size))                # True=允许
+        scores = scores.masked_fill(~causal_mask, float("-inf"))
+
+        top_scores, top_idx = torch.topk(scores, k=top_k, dim=-1)    # [BH, tb, topk]
+        
+
+        # softmax over top-k（对 -inf 行会得到 NaN，随后设为 0）
+        w = F.softmax(top_scores.to(torch.float32), dim=-1).to(q_blk.dtype)     # [BH, tb, topk]
+        w = torch.nan_to_num(w, nan=0.0)
+
+        # 累加输出：按 j 循环避免物化 [BH,tb,topk,K,V] 或 [BH,tb,topk,V]
+        out_blk = torch.zeros((BH, tb, V), device=device, dtype=q_blk.dtype)
+
+        # 预生成 [BH, tb] 的批次索引，做高级索引时少分配
+        bh_arange = torch.arange(BH, device=device).view(BH, 1).expand(BH, tb)
+
+        for j in range(top_k):
+            idx_j = top_idx[:, :, j]                                       # [BH, tb] in [0..N)
+            # h_sel: [BH, tb, K, V]
+            h_sel = h_bh[bh_arange, idx_j]
+
+            # 计算 (q_blk @ h_sel) -> [BH, tb, V]
+            # 先把维度摊平成 batched bmm
+            q_lin = q_blk.reshape(BH * tb, K).unsqueeze(1)                  # [BH*tb, 1, K]
+            h_lin = h_sel.reshape(BH * tb, K, V)                            # [BH*tb, K, V]
+            prod = torch.bmm(q_lin, h_lin).squeeze(1).reshape(BH, tb, V)    # [BH, tb, V]
+
+            out_blk = out_blk + prod * w[:, :, j].unsqueeze(-1)             # 加权累加
+
+        o_bh[:, t0:t1, :] = out_blk
+
+    # 还原回 [B, T, H, V]
+    o = o_bh.view(B, H, T, V).transpose(1, 2).contiguous()
+    return o
 
 @torch.compiler.disable
 def chunk_gated_delta_lora(
@@ -392,24 +478,26 @@ def chunk_gated_delta_lora(
     N = T//chunk_size
     _, _, _, K, V = h.shape
     k_sim = k[:, :, :, head_k_ori:].transpose(1, 2)
-    q_lora = q[:, :, :, head_k_ori:].transpose(1, 2)   #q_lora [B, H, T, k_lora]
+    # q_lora = q[:, :, :, head_k_ori:].transpose(1, 2)   #q_lora [B, H, T, k_lora]
     k_cmp = mean_pooling(k_sim, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=True)
-    scores = torch.matmul(q_lora, k_cmp.transpose(2, 3))    # scores [B, H, T, N]
-    t_indices = torch.arange(T, device=q.device).view(T, 1)
-    n_indices = torch.arange(N, device=q.device).view(1, N)
-    chunk_indices_for_t = t_indices // chunk_size
-    # causal_mask 的形状是 [T, N], 当 n < (t // C) 时，值为 True，表示允许访问
-    causal_mask = n_indices < chunk_indices_for_t
-    masked_scores = scores.masked_fill_(~causal_mask, -torch.inf)
-    top_scores, top_indices = torch.topk(masked_scores, k=top_k, dim=-1)
-    indices_for_gather = top_indices.view(B, H, T, top_k, 1, 1).expand(-1, -1, -1, -1, K, V)
-    h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
-    S = torch.gather(h_expanded, dim=3, index=indices_for_gather)  # S [B, H, T, topk, K, V]
-    o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
-    # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
-    # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
-    weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # weights [B, H, T, topk, 1]
-    weights = torch.nan_to_num(weights, nan=0.0)
-    o_lora = torch.sum(o_lora_all * weights, dim=-2)  # [B, T, H, v_lora]
-    o_final = torch.concat([o[:, :, :, :head_v_ori], o_lora.transpose(1, 2)], dim=-1)
+    # scores = torch.matmul(q_lora, k_cmp.transpose(2, 3))    # scores [B, H, T, N]
+    # t_indices = torch.arange(T, device=q.device).view(T, 1)
+    # n_indices = torch.arange(N, device=q.device).view(1, N)
+    # chunk_indices_for_t = t_indices // chunk_size
+    # # causal_mask 的形状是 [T, N], 当 n < (t // C) 时，值为 True，表示允许访问
+    # causal_mask = n_indices < chunk_indices_for_t
+    # masked_scores = scores.masked_fill_(~causal_mask, -torch.inf)
+    # top_scores, top_indices = torch.topk(masked_scores, k=top_k, dim=-1)
+    # indices_for_gather = top_indices.view(B, H, T, top_k, 1, 1).expand(-1, -1, -1, -1, K, V)
+    # h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
+    # S = torch.gather(h_expanded, dim=3, index=indices_for_gather)  # S [B, H, T, topk, K, V]
+    # o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
+    # # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
+    # # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
+    # weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # weights [B, H, T, topk, 1]
+    # weights = torch.nan_to_num(weights, nan=0.0)
+    # o_lora = torch.sum(o_lora_all * weights, dim=-2)  # [B, T, H, v_lora]
+
+    o_lora = chunk_topk_lora_pytorch(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=256)
+    o_final = torch.concat([o[:, :, :, :head_v_ori], o_lora], dim=-1)
     return o_final, final_state
