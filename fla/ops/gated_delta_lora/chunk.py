@@ -357,7 +357,9 @@ def old_lora_topk(
     *,
     top_k: int,
     chunk_size: int,
-    head_k_ori: int = 0):
+    head_k_ori: int = 0,
+    block_t: int = 0,     
+):
     B, T, H, _ = q.shape
     _, _, N, K = k_cmp.shape
     V = h.shape[-1]
@@ -377,9 +379,19 @@ def old_lora_topk(
 
     b_idx = torch.arange(B, device=h.device)[:, None, None, None]
     h_idx = torch.arange(H, device=h.device)[None, :, None, None]
-    S = h[b_idx, h_idx, top_indices]   #[B, H, T, top_k, K, V]
+    if block_t <= 0:
+        S = h[b_idx, h_idx, top_indices]   #[B, H, T, top_k, K, V]
+        o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
+    else:
+        o_lora_all = torch.empty(B, H, T, top_k, V, device=h.device, dtype=q.dtype)
+        for t_start in range(0, T, block_t):
+            t_end = min(t_start + block_t, T)
+            q_chunk = q_lora[:, :, t_start:t_end]
+            top_indices_chunk = top_indices[:, :, t_start:t_end]
+            S_chunk = h[b_idx, h_idx, top_indices_chunk]
+            o_lora_chunk = torch.einsum('bhtk, bhtokv -> bhtov', q_chunk, S_chunk)
+            o_lora_all[:, :, t_start:t_end] = o_lora_chunk
 
-    o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
     # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
     # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
     weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # weights [B, H, T, topk, 1]
@@ -520,7 +532,7 @@ def chunk_gated_delta_lora(
     k_sim = k[:, :, :, head_k_ori:].transpose(1, 2)
     k_cmp = mean_pooling(k_sim, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=True)
     # 旧逻辑
-    o_lora = old_lora_topk(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori)
+    o_lora = old_lora_topk(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=512)
     # 新逻辑
     # o_lora = chunk_topk_lora_pytorch(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=256)
     o_final = torch.concat([o[:, :, :, :head_v_ori], o_lora], dim=-1)
