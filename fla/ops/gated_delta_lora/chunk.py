@@ -370,9 +370,15 @@ def old_lora_topk(
     causal_mask = n_indices < chunk_indices_for_t
     masked_scores = scores.masked_fill_(~causal_mask, -torch.inf)
     top_scores, top_indices = torch.topk(masked_scores, k=top_k, dim=-1)
-    indices_for_gather = top_indices.view(B, H, T, top_k, 1, 1).expand(-1, -1, -1, -1, K, V)
-    h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
-    S = torch.gather(h_expanded, dim=3, index=indices_for_gather)  # S [B, H, T, topk, K, V]
+
+    # indices_for_gather = top_indices.view(B, H, T, top_k, 1, 1).expand(-1, -1, -1, -1, K, V)
+    # h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
+    # S = torch.gather(h_expanded, dim=3, index=indices_for_gather)  # S [B, H, T, topk, K, V]
+
+    b_idx = torch.arange(B, device=h.device)[:, None, None, None]
+    h_idx = torch.arange(H, device=h.device)[None, :, None, None]
+    S = h[b_idx, h_idx, top_indices]   #[B, H, T, top_k, K, V]
+
     o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
     # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
     # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
