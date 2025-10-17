@@ -16,6 +16,265 @@ from fla.ops.utils.pooling import mean_pooling
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 from torch.nn import functional as F
 
+try:
+    import triton
+    import triton.language as tl
+except Exception as e:  # pragma: no cover
+    triton = None
+    tl = None
+
+BLOCK_K = 64
+BLOCK_V = 64
+NUM_WARPS_FWD = 4
+NUM_WARPS_DQ = 4
+NUM_WARPS_DH = 4
+
+
+@triton.jit
+def _fwd_kernel(
+    Q, H, TOPI, OUT,
+    # sizes
+    BH: tl.constexpr, T: tl.constexpr, O: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    # strides
+    stride_q_bh, stride_q_t, stride_q_k,
+    stride_h_bh, stride_h_n, stride_h_k, stride_h_v,
+    stride_top_bh, stride_top_t, stride_top_o,
+    stride_out_bh, stride_out_t, stride_out_o, stride_out_v,
+    # meta
+    BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    pid0 = tl.program_id(0)  # over BH*T*O
+    pid1 = tl.program_id(1)  # over V tiles
+
+    # Map linear id -> (bh, t, o)
+    TO = T * O
+    bh = pid0 // TO
+    rem = pid0 % TO
+    t = rem // O
+    o = rem % O
+
+    v_offs = pid1 * BLOCK_V + tl.arange(0, BLOCK_V)
+    v_mask = v_offs < V
+
+    # Load n = top_indices[bh, t, o]
+    top_ptr = TOPI + bh * stride_top_bh + t * stride_top_t + o * stride_top_o
+    n = tl.load(top_ptr, mask=True, other=0).to(tl.int32)
+
+    # Base pointers
+    q_ptr = Q + bh * stride_q_bh + t * stride_q_t
+    out_ptr = OUT + bh * stride_out_bh + t * stride_out_t + o * stride_out_o + v_offs * stride_out_v
+    h_ptr_base = H + bh * stride_h_bh + n * stride_h_n + v_offs * stride_h_v
+
+    acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + k_offs
+        k_mask = kk < K
+        q = tl.load(q_ptr + kk * stride_q_k, mask=k_mask, other=0.0).to(tl.float32)
+        # h tile: [BLOCK_K, BLOCK_V] at (k,v)
+        h_tile = tl.load(
+            h_ptr_base + kk[:, None] * stride_h_k,
+            mask=(k_mask[:, None] & v_mask[None, :]),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(h_tile * q[:, None], axis=0)
+    # store
+    acc = acc.to(tl.float32)  # keep in fp32 then cast as needed
+    # cast to OUT dtype
+    acc_cast = acc.to(Q.dtype.element_ty)
+    tl.store(out_ptr, acc_cast, mask=v_mask)
+
+
+@triton.jit
+def _dq_kernel(
+    DOUT, H, TOPI, DQ,
+    # sizes
+    BH: tl.constexpr, T: tl.constexpr, O: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    # strides
+    stride_do_bh, stride_do_t, stride_do_o, stride_do_v,
+    stride_h_bh, stride_h_n, stride_h_k, stride_h_v,
+    stride_top_bh, stride_top_t, stride_top_o,
+    stride_dq_bh, stride_dq_t, stride_dq_k,
+    BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    # Grid: (BH*T, ceil_div(K, BLOCK_K))
+    pid0 = tl.program_id(0)  # over BH*T
+    pid1 = tl.program_id(1)  # over K tiles
+
+    bh = pid0 // T
+    t = pid0 % T
+
+    k_offs = pid1 * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_offs < K
+
+    dq_acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+
+    # Loop over o and V in tiles
+    for o in range(0, O):
+        # n index for this (bh,t,o)
+        top_ptr = TOPI + bh * stride_top_bh + t * stride_top_t + o * stride_top_o
+        n = tl.load(top_ptr, mask=True, other=0).to(tl.int32)
+        # Pointers
+        dout_too_ptr = DOUT + bh * stride_do_bh + t * stride_do_t + o * stride_do_o
+        h_base_ptr = H + bh * stride_h_bh + n * stride_h_n
+
+        for v0 in range(0, V, BLOCK_V):
+            v_offs = v0 + tl.arange(0, BLOCK_V)
+            v_mask = v_offs < V
+            dout_tile = tl.load(dout_too_ptr + v_offs * stride_do_v, mask=v_mask, other=0.0).to(tl.float32)
+            h_tile = tl.load(
+                h_base_ptr + k_offs[:, None] * stride_h_k + v_offs[None, :] * stride_h_v,
+                mask=(k_mask[:, None] & v_mask[None, :]),
+                other=0.0,
+            ).to(tl.float32)
+            dq_acc += tl.sum(h_tile * dout_tile[None, :], axis=1)
+
+    dq_ptr = DQ + bh * stride_dq_bh + t * stride_dq_t + k_offs * stride_dq_k
+    dq_cast = dq_acc.to(DQ.dtype.element_ty)
+    tl.store(dq_ptr, dq_cast, mask=k_mask)
+
+
+@triton.jit
+def _dh_kernel(
+    DOUT, Q, TOPI, DH,
+    # sizes
+    BH: tl.constexpr, T: tl.constexpr, O: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    # strides
+    stride_do_bh, stride_do_t, stride_do_o, stride_do_v,
+    stride_q_bh, stride_q_t, stride_q_k,
+    stride_top_bh, stride_top_t, stride_top_o,
+    stride_dh_bh, stride_dh_n, stride_dh_k, stride_dh_v,
+    BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    # Grid: (BH*T*O, ceil_div(V, BLOCK_V))
+    pid0 = tl.program_id(0)  # over BH*T*O
+    pid1 = tl.program_id(1)  # over V tiles
+
+    TO = T * O
+    bh = pid0 // TO
+    rem = pid0 % TO
+    t = rem // O
+    o = rem % O
+
+    v_offs = pid1 * BLOCK_V + tl.arange(0, BLOCK_V)
+    v_mask = v_offs < V
+
+    # load n index
+    top_ptr = TOPI + bh * stride_top_bh + t * stride_top_t + o * stride_top_o
+    n = tl.load(top_ptr, mask=True, other=0).to(tl.int32)
+
+    dout_ptr = DOUT + bh * stride_do_bh + t * stride_do_t + o * stride_do_o + v_offs * stride_do_v
+    q_ptr = Q + bh * stride_q_bh + t * stride_q_t
+    dh_base_ptr = DH + bh * stride_dh_bh + n * stride_dh_n + v_offs * stride_dh_v
+
+    # Outer-product accumulation with atomics: for each K tile, atomic_add into DH
+    k_offs = tl.arange(0, BLOCK_K)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + k_offs
+        k_mask = kk < K
+        q = tl.load(q_ptr + kk * stride_q_k, mask=k_mask, other=0.0)
+        dout = tl.load(dout_ptr, mask=v_mask, other=0.0)
+        outer = (q[:, None].to(tl.float32)) * (dout[None, :].to(tl.float32))
+        # cast to DH dtype before atomics
+        # outer_cast = outer.to(DH.dtype.element_ty)
+        outer_cast = outer.to(tl.float32)
+        tl.atomic_add(
+            dh_base_ptr + kk[:, None] * stride_dh_k,
+            outer_cast,
+            mask=(k_mask[:, None] & v_mask[None, :]),
+        )
+
+
+# =============================
+# PyTorch Autograd Wrapper
+# =============================
+
+class _TopkLoRAFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, h: torch.Tensor, top_indices: torch.Tensor):
+        if triton is None:
+            raise RuntimeError("Triton is not available in this environment.")
+
+        B, H, T, K = q.shape
+        _, _, N, _, V = h.shape
+        O = top_indices.shape[-1]
+        BH = B * H
+
+        # Flatten BH leading dims for simpler stride math
+        q_bh = q.reshape(BH, T, K)
+        h_bh = h.reshape(BH, N, K, V)
+        top_bh = top_indices.reshape(BH, T, O)
+        out = torch.empty((BH, T, O, V), device=q.device, dtype=q.dtype)
+
+        grid = (BH * T * O, triton.cdiv(V, BLOCK_V))
+        _fwd_kernel[grid](
+            q_bh, h_bh, top_bh, out,
+            # sizes
+            BH, T, O, K, V,
+            # strides (note: PyTorch strides are in elements)
+            q_bh.stride(0), q_bh.stride(1), q_bh.stride(2),
+            h_bh.stride(0), h_bh.stride(1), h_bh.stride(2), h_bh.stride(3),
+            top_bh.stride(0), top_bh.stride(1), top_bh.stride(2),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
+            num_warps=NUM_WARPS_FWD,
+        )
+
+        ctx.save_for_backward(q_bh, h_bh, top_bh)
+        ctx.meta = (BH, T, O, K, V)
+        return out.reshape(B, H, T, O, V)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        q_bh, h_bh, top_bh = ctx.saved_tensors
+        BH, T, O, K, V = ctx.meta
+
+        grad_out_bh = grad_out.reshape(BH, T, O, V).contiguous()
+
+        # dq
+        dq = torch.empty((BH, T, K), device=grad_out.device, dtype=grad_out.dtype)
+        grid_dq = (BH * T, triton.cdiv(K, BLOCK_K))
+        _dq_kernel[grid_dq](
+            grad_out_bh, h_bh, top_bh, dq,
+            BH, T, O, K, V,
+            grad_out_bh.stride(0), grad_out_bh.stride(1), grad_out_bh.stride(2), grad_out_bh.stride(3),
+            h_bh.stride(0), h_bh.stride(1), h_bh.stride(2), h_bh.stride(3),
+            top_bh.stride(0), top_bh.stride(1), top_bh.stride(2),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
+            num_warps=NUM_WARPS_DQ,
+        )
+
+        # dh (atomic adds)
+        dh = torch.zeros_like(h_bh, dtype=torch.float32)
+        grid_dh = (BH * T * O, triton.cdiv(V, BLOCK_V))
+        _dh_kernel[grid_dh](
+            grad_out_bh, q_bh, top_bh, dh,
+            BH, T, O, K, V,
+            grad_out_bh.stride(0), grad_out_bh.stride(1), grad_out_bh.stride(2), grad_out_bh.stride(3),
+            q_bh.stride(0), q_bh.stride(1), q_bh.stride(2),
+            top_bh.stride(0), top_bh.stride(1), top_bh.stride(2),
+            dh.stride(0), dh.stride(1), dh.stride(2), dh.stride(3),
+            BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
+            num_warps=NUM_WARPS_DH,
+        )
+
+        # Reshape grads back to original shapes
+        B = grad_out.shape[0]
+        H = grad_out.shape[1]
+        dq = dq.reshape(B, H, T, K)
+        # dh = dh.reshape(B, H, -1, K, V)
+        dh = dh.to(h_bh.dtype).reshape(B, H, -1, K, V)
+
+        # No grad for top_indices
+        return dq, dh, None
+
+
+def topk_lora_triton(q: torch.Tensor, h: torch.Tensor, top_indices: torch.Tensor) -> torch.Tensor:
+    """User-facing functional API."""
+    return _TopkLoRAFunction.apply(q, h, top_indices)
+
 
 
 def chunk_gated_delta_lora_fwd(
@@ -265,89 +524,6 @@ class ChunkGatedDeltaLoraFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
         return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
 
-@torch.compile
-def chunk_topk_lora_pytorch(
-    q,                 # [B, T, H, K_total]
-    k_cmp,             # [B, H, N, K_lora]  —— 已做mean_pooling后的K
-    h,                 # [B, H, N, K_lora, V]
-    *,
-    top_k: int,
-    chunk_size: int,
-    head_k_ori: int = 0,
-    block_t: int = 256,     # T方向tile
-):
-    """
-    返回：o_lora [B, T, H, V]
-    与你原逻辑等价：q_lora对k_cmp做top-k，取对应chunk的h，并计算q@h后按softmax(topk scores)加权求和。
-    """
-    device = q.device
-    dtype_q = q.dtype
-
-    # 预处理到 [BH, ...] 的扁平视图，减少花式广播和维度转置成本
-    B, T, H, K_total = q.shape
-    BH = B * H
-    # 只取 LoRA 部分
-    q_lora = q[:, :, :, head_k_ori:].transpose(1, 2).contiguous()        # [B, H, T, K]
-    k_cmp  = k_cmp.contiguous()                                           # [B, H, N, K]
-    h      = h.contiguous()                                               # [B, H, N, K, V]
-
-    _, _, N, K = k_cmp.shape
-    V = h.shape[-1]
-
-    q_bh = q_lora.reshape(BH, T, K)               # [BH, T, K]
-    k_bh = k_cmp.reshape(BH, N, K)                # [BH, N, K]
-    h_bh = h.reshape(BH, N, K, V)                 # [BH, N, K, V]
-
-    o_bh = torch.zeros((BH, T, V), device=device, dtype=dtype_q)
-
-    for t0 in range(0, T, block_t):
-        t1 = min(T, t0 + block_t)
-        tb = t1 - t0
-        q_blk = q_bh[:, t0:t1, :]                                  # [BH, tb, K]
-
-        # 计算 Top-K（两种方式：一次性 or N方向流式）
-        # 一次性算 [BH, tb, N] 分数（适合N中等）
-        # scores = q_blk @ k_bh^T
-        scores = torch.bmm(q_blk, k_bh.transpose(1, 2))        # [BH, tb, N]
-
-        # 微型因果mask：[tb, N]
-        t_idx = torch.arange(t0, t1, device=device).view(1, tb, 1)   # 真实时间步
-        n_idx = torch.arange(N, device=device).view(1, 1, N)
-        causal_mask = (n_idx < (t_idx // chunk_size))                # True=允许
-        scores = scores.masked_fill(~causal_mask, float("-inf"))
-
-        top_scores, top_idx = torch.topk(scores, k=top_k, dim=-1)    # [BH, tb, topk]
-        
-
-        # softmax over top-k（对 -inf 行会得到 NaN，随后设为 0）
-        w = F.softmax(top_scores.to(torch.float32), dim=-1).to(q_blk.dtype)     # [BH, tb, topk]
-        w = torch.nan_to_num(w, nan=0.0)
-
-        # 累加输出：按 j 循环避免物化 [BH,tb,topk,K,V] 或 [BH,tb,topk,V]
-        out_blk = torch.zeros((BH, tb, V), device=device, dtype=q_blk.dtype)
-
-        # 预生成 [BH, tb] 的批次索引，做高级索引时少分配
-        bh_arange = torch.arange(BH, device=device).view(BH, 1).expand(BH, tb)
-
-        for j in range(top_k):
-            idx_j = top_idx[:, :, j]                                       # [BH, tb] in [0..N)
-            # h_sel: [BH, tb, K, V]
-            h_sel = h_bh[bh_arange, idx_j]
-
-            # 计算 (q_blk @ h_sel) -> [BH, tb, V]
-            # 先把维度摊平成 batched bmm
-            q_lin = q_blk.reshape(BH * tb, K).unsqueeze(1)                  # [BH*tb, 1, K]
-            h_lin = h_sel.reshape(BH * tb, K, V)                            # [BH*tb, K, V]
-            prod = torch.bmm(q_lin, h_lin).squeeze(1).reshape(BH, tb, V)    # [BH, tb, V]
-
-            out_blk = out_blk + prod * w[:, :, j].unsqueeze(-1)             # 加权累加
-
-        o_bh[:, t0:t1, :] = out_blk
-
-    # 还原回 [B, T, H, V]
-    o = o_bh.view(B, H, T, V).transpose(1, 2).contiguous()
-    return o
-
 
 @torch.compile
 def old_lora_topk(
@@ -358,7 +534,8 @@ def old_lora_topk(
     top_k: int,
     chunk_size: int,
     head_k_ori: int = 0,
-    block_t: int = 0,     
+    block_t: int = 0, 
+    use_triton: bool = False,    
 ):
     B, T, H, _ = q.shape
     _, _, N, K = k_cmp.shape
@@ -377,20 +554,30 @@ def old_lora_topk(
     # h_expanded = h.unsqueeze(2).expand(-1, -1, T, -1, -1, -1)
     # S = torch.gather(h_expanded, dim=3, index=indices_for_gather)  # S [B, H, T, topk, K, V]
 
-    b_idx = torch.arange(B, device=h.device)[:, None, None, None]
-    h_idx = torch.arange(H, device=h.device)[None, :, None, None]
-    if block_t <= 0:
-        S = h[b_idx, h_idx, top_indices]   #[B, H, T, top_k, K, V]
-        o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
+    
+    if use_triton:
+        o_lora_all = topk_lora_triton(
+            q_lora,    # [B, H, T, K]
+            h,         # [B, H, N, K, V]
+            top_indices  # [B, H, T, top_k]
+        )   #[B, H, T, topk, V]
+
     else:
-        o_lora_all = torch.empty(B, H, T, top_k, V, device=h.device, dtype=q.dtype)
-        for t_start in range(0, T, block_t):
-            t_end = min(t_start + block_t, T)
-            q_chunk = q_lora[:, :, t_start:t_end]
-            top_indices_chunk = top_indices[:, :, t_start:t_end]
-            S_chunk = h[b_idx, h_idx, top_indices_chunk]
-            o_lora_chunk = torch.einsum('bhtk, bhtokv -> bhtov', q_chunk, S_chunk)
-            o_lora_all[:, :, t_start:t_end] = o_lora_chunk
+        b_idx = torch.arange(B, device=h.device)[:, None, None, None]
+        h_idx = torch.arange(H, device=h.device)[None, :, None, None]
+        # 分块计算以节省显存
+        if block_t <= 0:
+            S = h[b_idx, h_idx, top_indices]   #[B, H, T, top_k, K, V]
+            o_lora_all = torch.einsum('bhtk, bhtokv -> bhtov', q_lora, S)  #[B, H, T, topk, V]
+        else:
+            o_lora_all = torch.empty(B, H, T, top_k, V, device=h.device, dtype=q.dtype)
+            for t_start in range(0, T, block_t):
+                t_end = min(t_start + block_t, T)
+                q_chunk = q_lora[:, :, t_start:t_end]
+                top_indices_chunk = top_indices[:, :, t_start:t_end]
+                S_chunk = h[b_idx, h_idx, top_indices_chunk]
+                o_lora_chunk = torch.einsum('bhtk, bhtokv -> bhtov', q_chunk, S_chunk)
+                o_lora_all[:, :, t_start:t_end] = o_lora_chunk
 
     # q_lora_expand = q_lora.unsqueeze(3).unsqueeze(-2).expand(-1, -1, -1, top_k, -1, -1)
     # o_lora_all = torch.matmul(q_lora_expand, S).squeeze(-2)
@@ -532,7 +719,7 @@ def chunk_gated_delta_lora(
     k_sim = k[:, :, :, head_k_ori:].transpose(1, 2)
     k_cmp = mean_pooling(k_sim, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=True)
     # 旧逻辑
-    o_lora = old_lora_topk(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=512)
+    o_lora = old_lora_topk(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=0, use_triton=True)
     # 新逻辑
     # o_lora = chunk_topk_lora_pytorch(q, k_cmp, h, top_k=top_k, chunk_size=chunk_size, head_k_ori=head_k_ori, block_t=256)
     o_final = torch.concat([o[:, :, :, :head_v_ori], o_lora], dim=-1)
